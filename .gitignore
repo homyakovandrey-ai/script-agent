@@ -1,0 +1,17 @@
+# Environment — contains API keys, never commit
+.env
+
+# Vault scripts (1500+ files, not code)
+vault/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Word output
+*.docx
+
+# OS
+.DS_Store
+Thumbs.db
