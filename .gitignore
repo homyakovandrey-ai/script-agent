@@ -1,8 +1,6 @@
 # Environment — contains API keys, never commit
 .env
 
-# Vault scripts (1500+ files, not code)
-vault/
 
 # Python
 __pycache__/
