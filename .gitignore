@@ -7,6 +7,12 @@ __pycache__/
 *.py[cod]
 *.pyo
 
+# Generated output
+output/
+
+# Claude Code local config
+.claude/
+
 # Word output
 *.docx
 

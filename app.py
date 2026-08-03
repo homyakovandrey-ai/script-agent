@@ -120,6 +120,19 @@ def build_script_tab(nb: ttk.Notebook):
     _paste_button(hdr, url_text).pack(side="right")
     url_text.focus()
 
+    check_row = tk.Frame(frame)
+    check_row.pack(fill="x", padx=10, pady=(2, 4))
+    check_btn = tk.Button(
+        check_row, text="Проверить ссылки", command=lambda: check_links(),
+        font=("Segoe UI", 9, "bold"), bg="#e8e8e8", relief="flat",
+        padx=8, cursor="hand2",
+    )
+    check_btn.pack(side="left")
+    check_status_var = tk.StringVar()
+    tk.Label(check_row, textvariable=check_status_var, fg="grey", font=("Segoe UI", 8)).pack(
+        side="left", padx=(8, 0)
+    )
+
     row = tk.Frame(frame)
     row.pack(fill="x", **pad)
     tk.Label(row, text="Длина (мин)").pack(side="left")
@@ -145,9 +158,92 @@ def build_script_tab(nb: ttk.Notebook):
     inserts_var = tk.StringVar()
     _url_entry(frame, inserts_var).pack(fill="x", padx=10, pady=(0, 6))
 
+    manual_header = tk.Frame(frame)
+    manual_header.pack(fill="x", padx=10, pady=(4, 2))
+    tk.Label(manual_header, text="Материалы вручную (если ссылка не открывается)", anchor="w").pack(side="left")
+    manual_frame = tk.Frame(frame)
+    manual_frame.pack(fill="both", padx=10, pady=(0, 2))
+    manual_scroll = tk.Scrollbar(manual_frame)
+    manual_scroll.pack(side="right", fill="y")
+    manual_text = tk.Text(manual_frame, height=6, font=("Consolas", 10), wrap="word",
+                          yscrollcommand=manual_scroll.set)
+    manual_text.pack(side="left", fill="both", expand=True)
+    manual_scroll.config(command=manual_text.yview)
+    _bind_paste(manual_text)
+    _paste_button(manual_header, manual_text).pack(side="right")
+    tk.Label(
+        frame,
+        text="Перед текстом статьи укажи строку «URL: ссылка», для нескольких ссылок повтори блок:\n"
+             "URL: https://ссылка\nтекст статьи",
+        justify="left", fg="grey", font=("Segoe UI", 8), anchor="w",
+    ).pack(fill="x", padx=10, pady=(0, 6))
+
     log = _make_log(frame)
     status_var = tk.StringVar(value="Готов")
     _stop_event = threading.Event()
+
+    def check_links():
+        urls_raw = url_text.get("1.0", tk.END).strip()
+        if not urls_raw:
+            status_var.set("Введи хотя бы один URL")
+            return
+        _clear_log(log)
+        check_btn.configure(state="disabled", text="  Проверяю...  ")
+        check_status_var.set("")
+        status_var.set("Проверяю ссылки...")
+        redirector = _LogRedirect(log)
+        sys.stdout = redirector
+        sys.stderr = redirector
+
+        urls = urls_raw.split()
+
+        def worker():
+            try:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location(
+                    "script_agent", Path(__file__).parent / "script_agent.py"
+                )
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+
+                ok_count = 0
+                blocked = []
+                for u in urls:
+                    print(f"[*] {u}")
+                    ok, preview = mod.check_source(u)
+                    if ok:
+                        ok_count += 1
+                        print(f"    OK -> {preview}\n")
+                    else:
+                        blocked.append(u)
+                        print(f"    НЕ ЧИТАЕТСЯ -> {preview}\n")
+
+                print(f"[ИТОГ] Доступно: {ok_count}/{len(urls)}")
+                if blocked:
+                    print("Заполни «Материалы вручную» для:")
+                    for u in blocked:
+                        print(f"  {u}")
+
+                    existing = manual_text.get("1.0", tk.END)
+                    additions = "".join(
+                        f"URL: {u}\n\n" for u in blocked if f"URL: {u}" not in existing
+                    )
+                    if additions:
+                        prefix = "\n" if existing.strip() else ""
+                        frame.after(0, lambda a=additions, p=prefix: manual_text.insert(tk.END, p + a))
+
+                frame.after(0, lambda: check_status_var.set(f"Доступно: {ok_count}/{len(urls)}"))
+                frame.after(0, lambda: status_var.set("Проверка завершена"))
+            except Exception as e:
+                msg = str(e)
+                print(f"\n[ОШИБКА] {msg}")
+                frame.after(0, lambda m=msg: status_var.set(f"Ошибка: {m}"))
+            finally:
+                frame.after(0, lambda: check_btn.configure(
+                    state="normal", text="  Проверить ссылки  "
+                ))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def run():
         urls_raw = url_text.get("1.0", tk.END).strip()
@@ -171,6 +267,7 @@ def build_script_tab(nb: ttk.Notebook):
         inserts_raw = inserts_var.get().strip()
         inserts = inserts_raw.split() if inserts_raw else None
         note = note_text.get("1.0", tk.END).strip() or None
+        manual_materials_raw = manual_text.get("1.0", tk.END)
 
         def worker():
             try:
@@ -182,7 +279,8 @@ def build_script_tab(nb: ttk.Notebook):
                 spec.loader.exec_module(mod)
                 mod.generate_script(
                     urls, length_min=length_min, inserts=inserts,
-                    note=note, stop_event=_stop_event,
+                    note=note, manual_materials_raw=manual_materials_raw,
+                    stop_event=_stop_event,
                 )
                 if _stop_event.is_set():
                     frame.after(0, lambda: status_var.set(
@@ -328,7 +426,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Убиваю БПМ — Агент")
-        self.minsize(560, 700)
+        self.minsize(560, 780)
 
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=6, pady=6)
@@ -336,7 +434,7 @@ class App(tk.Tk):
         build_script_tab(nb)
         build_ingest_tab(nb)
 
-        w, h = 620, 780
+        w, h = 620, 880
         x = (self.winfo_screenwidth() - w) // 2
         y = (self.winfo_screenheight() - h) // 2
         self.geometry(f"{w}x{h}+{x}+{y}")

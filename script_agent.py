@@ -227,10 +227,53 @@ def save_to_docx(filename: str, content: str) -> str:
         return f"Ошибка Word: {e}"
 
 
+# ── Manual materials ───────────────────────────────────────────────────────────
+
+MANUAL_URL_LINE_RE = re.compile(r"^\s*URL:\s*(\S+)\s*$", re.IGNORECASE)
+
+
+def _normalize_url(url: str) -> str:
+    """Normalize a URL for matching: strip scheme, trailing slash, lowercase."""
+    url = url.strip()
+    url = re.sub(r"^https?://", "", url, flags=re.IGNORECASE)
+    return url.rstrip("/").lower()
+
+
+def parse_manual_materials(raw: str) -> dict[str, str]:
+    """Parse manually pasted article texts.
+
+    Format: a line `URL: <ссылка>` marks the start of a block; everything
+    until the next such line (or end of text) is that source's content.
+    Keys are normalized URLs for robust matching against fetch_url calls.
+    """
+    materials: dict[str, str] = {}
+    current_url = None
+    buf: list[str] = []
+
+    for line in raw.splitlines():
+        m = MANUAL_URL_LINE_RE.match(line)
+        if m:
+            if current_url and buf:
+                materials[_normalize_url(current_url)] = "\n".join(buf).strip()
+            current_url = m.group(1)
+            buf = []
+        else:
+            buf.append(line)
+
+    if current_url and buf:
+        materials[_normalize_url(current_url)] = "\n".join(buf).strip()
+
+    return materials
+
+
 # ── YouTube transcript ─────────────────────────────────────────────────────────
 
 YOUTUBE_RE = re.compile(
     r"(?:youtube\.com/(?:watch\?.*?v=|shorts/)|youtu\.be/)[\w-]+",
+    re.IGNORECASE,
+)
+WIKIPEDIA_RE = re.compile(
+    r"(?:https?://)?([a-z]{2,3})\.wikipedia\.org/wiki/(.+)",
     re.IGNORECASE,
 )
 
@@ -375,63 +418,248 @@ def fetch_telegram_post(url: str) -> str:
 
 # ── Web fetcher ────────────────────────────────────────────────────────────────
 
+def fetch_wikipedia(url: str) -> str:
+    """Fetch Wikipedia article via the Wikipedia API — returns clean plain text."""
+    import urllib.request
+    import urllib.parse
+
+    m = WIKIPEDIA_RE.match(url)
+    if not m:
+        return ""
+    lang = m.group(1)
+    title = m.group(2).split("#")[0]  # strip anchors
+
+    params = urllib.parse.urlencode({
+        "action": "query",
+        "prop": "extracts",
+        "explaintext": "true",
+        "titles": title,
+        "format": "json",
+        "redirects": "1",
+    })
+    api = f"https://{lang}.wikipedia.org/w/api.php?{params}"
+    req = urllib.request.Request(api, headers={
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0 Safari/537.36"
+        )
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        pages = data.get("query", {}).get("pages", {})
+        for page in pages.values():
+            if "extract" in page:
+                text = page["extract"].strip()
+                result = f"[Wikipedia] {page.get('title', title)}\n\n{text}"
+                if len(result) > 15_000:
+                    result = result[:15_000] + "\n\n[... статья обрезана ...]"
+                return result
+        return f"Статья Википедии не найдена: {url}"
+    except Exception as e:
+        return f"Ошибка Wikipedia API {url}: {e}"
+
+
+def _scrape_html(html: str) -> str:
+    """Extract readable text from HTML, stripping boilerplate."""
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "nav", "footer", "header", "aside", "noscript"]):
+        tag.decompose()
+    main = (
+        soup.find("article")
+        or soup.find("main")
+        or soup.find(id=lambda x: x and "content" in x.lower() if x else False)
+        or soup.body
+    )
+    raw = (main or soup).get_text(separator="\n", strip=True)
+    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+    text = "\n".join(lines)
+    if len(text) > 10_000:
+        text = text[:10_000] + "\n\n[... текст обрезан ...]"
+    return text
+
+
+def _is_bot_wall(text: str) -> bool:
+    if len(text) < 300:
+        return True
+    markers = ["cloudflare", "checking your browser", "enable javascript",
+               "ddos-guard", "just a moment", "verify you are human"]
+    lower = text.lower()
+    return any(m in lower for m in markers)
+
+
+def _extract_next_data_text(html: str) -> str | None:
+    """Extract readable text from Next.js __NEXT_DATA__ JSON (meduza.io, etc.)."""
+    match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
+    if not match:
+        return None
+    try:
+        data = json.loads(match.group(1))
+    except Exception:
+        return None
+    pieces: list[str] = []
+
+    def _collect(obj: object, depth: int = 0) -> None:
+        if depth > 25:
+            return
+        if isinstance(obj, str) and len(obj) >= 60:
+            pieces.append(obj)
+        elif isinstance(obj, list):
+            for item in obj:
+                _collect(item, depth + 1)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                _collect(v, depth + 1)
+
+    _collect(data)
+    if not pieces:
+        return None
+    text = "\n".join(pieces)
+    return text[:10_000] if len(text) > 10_000 else text
+
+
+def _try_wayback(url: str, headers: dict) -> str | None:
+    """Return archived HTML from Wayback Machine, or None on failure."""
+    try:
+        meta = _http.get(f"https://archive.org/wayback/available?url={url}", timeout=10)
+        snap = meta.json().get("archived_snapshots", {}).get("closest", {})
+        if snap.get("available") and snap.get("url"):
+            r = _http.get(snap["url"], headers=headers)
+            if r.status_code == 200:
+                return r.text
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_generic(url: str, headers: dict) -> str:
+    """Scrape a generic URL, with bot-wall/paywall/Next.js fallbacks via Wayback Machine."""
+    try:
+        response = _http.get(url, headers=headers)
+
+        if response.status_code in (401, 403):
+            # Paywall / auth wall — try Wayback Machine before giving up
+            archived = _try_wayback(url, headers)
+            if archived:
+                fallback = _scrape_html(archived)
+                if not _is_bot_wall(fallback) and len(fallback) > 200:
+                    return f"[Источник: Wayback Machine]\n\n{fallback}"
+            return (
+                f"Нет доступа к {url}: сайт требует авторизацию или платную подписку "
+                f"(HTTP {response.status_code}). Вставьте текст статьи в поле «Материалы вручную» "
+                f"в формате `URL: {url}` и запустите генерацию снова."
+            )
+
+        response.raise_for_status()
+        raw_html = response.text
+        text = _scrape_html(raw_html)
+
+        # Content too thin → try __NEXT_DATA__ (meduza.io, Next.js sites)
+        if len(text) < 500:
+            next_text = _extract_next_data_text(raw_html)
+            if next_text and len(next_text) > len(text):
+                text = next_text
+
+        if _is_bot_wall(text):
+            archived = _try_wayback(url, headers)
+            if archived:
+                fallback = _scrape_html(archived)
+                if not _is_bot_wall(fallback):
+                    return f"[Источник: Wayback Machine]\n\n{fallback}"
+            return (
+                f"Сайт {url} заблокировал автоматический доступ (защита от ботов Cloudflare/DDoS-Guard). "
+                f"Вставьте текст статьи в поле «Материалы вручную» в формате `URL: {url}` "
+                f"и запустите генерацию снова."
+            )
+
+        return text or "Не удалось извлечь текст со страницы."
+
+    except httpx.HTTPStatusError as e:
+        code = e.response.status_code
+        if code in (401, 403):
+            archived = _try_wayback(url, headers)
+            if archived:
+                fallback = _scrape_html(archived)
+                if not _is_bot_wall(fallback) and len(fallback) > 200:
+                    return f"[Источник: Wayback Machine]\n\n{fallback}"
+            return (
+                f"Нет доступа к {url}: HTTP {code} — требуется авторизация или подписка. "
+                f"Вставьте текст статьи в поле «Материалы вручную» в формате `URL: {url}` "
+                f"и запустите генерацию снова."
+            )
+        return f"Ошибка HTTP {code} при загрузке {url}."
+    except Exception as e:
+        # SSL error, timeout, network failure — try Wayback Machine
+        archived = _try_wayback(url, headers)
+        if archived:
+            fallback = _scrape_html(archived)
+            if not _is_bot_wall(fallback) and len(fallback) > 200:
+                return f"[Источник: Wayback Machine]\n\n{fallback}"
+        return f"Ошибка загрузки URL {url}: {e}"
+
+
 def fetch_url(url: str) -> str:
-    """Fetch readable text from a URL. YouTube → transcript via yt-dlp."""
+    """Fetch readable text from a URL. YouTube → transcript, Telegram → пост, Wikipedia → API, else scrape."""
     if url in _url_cache:
         return _url_cache[url]
+
     if YOUTUBE_RE.search(url):
         result = fetch_youtube_transcript(url)
-        _url_cache[url] = result
-        return result
-    if TELEGRAM_RE.search(url):
+    elif TELEGRAM_RE.search(url):
         result = fetch_telegram_post(url)
-        _url_cache[url] = result
-        return result
-    try:
+    elif WIKIPEDIA_RE.match(url):
+        result = fetch_wikipedia(url)
+    else:
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0 Safari/537.36"
-            )
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
         }
-        response = _http.get(url, headers=headers)
-        response.raise_for_status()
+        result = _fetch_generic(url, headers)
 
-        soup = BeautifulSoup(response.text, "html.parser")
+    _url_cache[url] = result
+    return result
 
-        # Remove boilerplate tags
-        for tag in soup(["script", "style", "nav", "footer", "header", "aside", "noscript"]):
-            tag.decompose()
 
-        # Prefer semantic content containers
-        main = (
-            soup.find("article")
-            or soup.find("main")
-            or soup.find(id=lambda x: x and "content" in x.lower() if x else False)
-            or soup.body
-        )
-        raw_text = (main or soup).get_text(separator="\n", strip=True)
+_PROBLEM_MARKERS = (
+    "Ошибка", "Нет доступа", "заблокировал", "Не удалось извлечь",
+    "не установлен", "не найдена", "недоступны", "ошибка загрузки субтитров",
+)
 
-        # Collapse blank lines
-        lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
-        text = "\n".join(lines)
 
-        # Cap at ~10 000 chars
-        if len(text) > 10_000:
-            text = text[:10_000] + "\n\n[... текст обрезан ...]"
+def check_source(url: str) -> tuple[bool, str]:
+    """Пробует загрузить URL через fetch_url без обращения к LLM.
 
-        result = text or "Не удалось извлечь текст со страницы."
-        _url_cache[url] = result
-        return result
-    except Exception as e:
-        return f"Ошибка загрузки URL {url}: {e}"
+    Возвращает (ok, превью/сообщение) — позволяет узнать заранее, прочитается
+    ли ссылка, не тратя токены на запуск агента.
+    """
+    text = fetch_url(url)
+    is_problem = len(text) < 200 or any(m in text[:300] for m in _PROBLEM_MARKERS)
+    preview = text[:200].replace("\n", " ").strip()
+    return (not is_problem), preview
 
 # ── Prompt builder ─────────────────────────────────────────────────────────────
+
+def _load_claude_md() -> str:
+    """Load CLAUDE.md from the project root if it exists."""
+    path = Path(__file__).parent / "CLAUDE.md"
+    if path.exists():
+        try:
+            return "\n\n---\n## ИНСТРУКЦИИ ПО КАНАЛУ (CLAUDE.md)\n\n" + path.read_text(encoding="utf-8")
+        except Exception:
+            pass
+    return ""
+
 
 def build_system_prompt(scripts: list[dict]) -> str:
     """Build the system prompt. All existing scripts are embedded and cached."""
 
+    claude_md = _load_claude_md()
     examples_block = ""
     if scripts:
         examples_block = "\n\n---\n## ТВОИ ПРЕДЫДУЩИЕ СЦЕНАРИИ\n\n"
@@ -567,7 +795,7 @@ def build_system_prompt(scripts: list[dict]) -> str:
 - Не пиши три предложения подряд одинаковой длины
 - Чередуй: короткий удар → развёрнутая мысль → снова удар
 - Каждое предложение — живой человек что-то делает, а не абстракция «происходит»
-
+{claude_md}
 {examples_block}"""
 
 # ── Tool definitions (JSON Schema) ────────────────────────────────────────────
@@ -612,8 +840,12 @@ TOOLS = [
 
 # ── Tool executor ──────────────────────────────────────────────────────────────
 
-def run_tool(name: str, inputs: dict) -> str:
+def run_tool(name: str, inputs: dict, manual_materials: dict[str, str] | None = None) -> str:
     if name == "fetch_url":
+        if manual_materials:
+            key = _normalize_url(inputs["url"])
+            if key in manual_materials:
+                return f"[Материал предоставлен пользователем вручную]\n\n{manual_materials[key]}"
         return fetch_url(inputs["url"])
     if name == "save_to_vault":
         md_result = save_to_vault(inputs["filename"], inputs["content"])
@@ -637,6 +869,7 @@ def generate_script(
     length_min: int | None = None,
     inserts: list[str] | None = None,
     note: str | None = None,
+    manual_materials_raw: str | None = None,
     stop_event=None,
 ) -> None:
     _LOG_PATH.write_text("", encoding="utf-8")  # clear log at start
@@ -644,6 +877,14 @@ def generate_script(
         api_key=ANTHROPIC_API_KEY,
         http_client=httpx.Client(trust_env=False),
     )
+
+    manual_materials = parse_manual_materials(manual_materials_raw or "")
+
+    def _source_text(u: str) -> str:
+        key = _normalize_url(u)
+        if key in manual_materials:
+            return f"[Материал предоставлен пользователем вручную]\n\n{manual_materials[key]}"
+        return fetch_url(u)
 
     print(f"\n[>] Источников: {len(urls)}")
     for u in urls:
@@ -654,10 +895,14 @@ def generate_script(
         print(f"    Вставок задано: {len(inserts)}")
     if note:
         print(f"    Указание: {note}")
+    if manual_materials:
+        print(f"    Материалов вручную: {len(manual_materials)}")
+        for u in manual_materials:
+            print(f"        {u}")
     print("[*] Загружаю источники и читаю vault...")
     pre_text = ""
     for u in urls:
-        pre_text += fetch_url(u) + "\n\n"
+        pre_text += _source_text(u) + "\n\n"
 
     total = sum(1 for _ in VAULT_PATH.glob("**/*.md")) if VAULT_PATH.exists() else 0
     scripts = load_smart_vault_scripts(pre_text)
@@ -672,7 +917,7 @@ def generate_script(
     user_msg = "Напиши полный сценарий для YouTube-ролика на основе следующих материалов.\n\n"
 
     for i, u in enumerate(urls, 1):
-        content = fetch_url(u)
+        content = _source_text(u)
         user_msg += f"## Источник {i}: {u}\n\n{content}\n\n---\n\n"
 
     if length_min:
@@ -706,7 +951,7 @@ def generate_script(
             break
         with client.messages.stream(
             model=MODEL,
-            max_tokens=16000,
+            max_tokens=32000,
             thinking={"type": "adaptive"},
             system=[
                 {
@@ -758,7 +1003,7 @@ def generate_script(
                     short_input = short_input[:120] + "…"
                 print(f"\n[tool] {block.name}({short_input})")
 
-                result = run_tool(block.name, block.input)
+                result = run_tool(block.name, block.input, manual_materials)
 
                 if block.name == "save_to_vault":
                     vault_saved = True
@@ -834,9 +1079,26 @@ def main():
         "--note", metavar="TEXT",
         help="Любые дополнительные указания агенту (в кавычках)",
     )
+    parser.add_argument(
+        "--manual-file", metavar="PATH",
+        help=(
+            "Путь к файлу с текстами статей для ссылок, которые не открываются. "
+            "Формат: строка `URL: <ссылка>`, ниже — текст статьи, для каждой ссылки свой блок."
+        ),
+    )
     args = parser.parse_args()
 
-    generate_script(args.urls, length_min=args.length, inserts=args.insert, note=args.note)
+    manual_materials_raw = None
+    if args.manual_file:
+        manual_materials_raw = Path(args.manual_file).read_text(encoding="utf-8")
+
+    generate_script(
+        args.urls,
+        length_min=args.length,
+        inserts=args.insert,
+        note=args.note,
+        manual_materials_raw=manual_materials_raw,
+    )
 
 
 if __name__ == "__main__":
