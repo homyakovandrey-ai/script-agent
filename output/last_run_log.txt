@@ -1,0 +1,61 @@
+
+[>] Источников: 20
+    https://t.me/rhymesmus/58794
+    https://t.me/bpmkiller/15102
+    https://the-flow.ru/news/morgenshtern-oficialno-stal-evreem-i-smenil-imya
+    https://the-flow.ru/news/morgenshtern-world-tour-2
+    https://the-flow.ru/news/kizaru-popal-v-bolnicu-albom-zaderzhivaetsya
+    https://the-flow.ru/news/kizaru-anonsiroval-albom-v-etom-godu
+    https://the-flow.ru/news/devushka-kizaru-silla
+    https://the-flow.ru/news/kizaru-pro-turnu
+    https://respawn.media/celebrities/3ev3h-buster-zavershaet-kareru-strimera
+    https://t.me/bpmkiller/15095
+    https://t.me/zavodny/22708
+    https://t.me/zavodny/22249
+    https://www.mentoday.ru/life/news/17-06-2026/oliver-tri-jiv-v-seti-zavirusilas-teoriya-zagovora-o-gibeli-pevca/?utm_source=google.com&utm_medium=organic&utm_campaign=google.com&utm_referrer=google.com
+    https://t.me/rhymesmus/58746
+    https://the-flow.ru/news/tay-keith-rip
+    https://the-flow.ru/news/temnyy-princ-dogvill
+    https://the-flow.ru/news/heronnwater-19-summer-nights
+    https://the-flow.ru/news/toxis-zarabatyveat-ot-10-millionov-v-nedelyu
+    https://t.me/superslowflow/29411
+    https://t.me/rhymesmus/58776
+    Длина: ~25 мин
+    Указание: Напиши новостной дайджест со следующими новостями: Моргенштерн обеднел, Кизару подстрелили, Бустер уходит с твича и заканчивает стримерскую карьеру (но у него ещё будут большие стримы с Айшоусидом и макгрегором), теория о том, что oLIVER tREE не умер, токсис сообщил о своих впечатляющих доходах, про музыкальные новинки: новые треки Темного Принца и Хероноватэра, западные новости: умер продюсер Tay Keith
+[*] Загружаю источники и читаю vault...
+    → Совпали сущности: моргенштерн, скриптонит
+    → Загружено 30 тематических + 0 свежих
+    → Итого загружено 30 из 1524 сценариев
+
+[AI] Агент работает...
+
+────────────────────────────────────────────────────────────
+
+
+[tool] save_to_vault({"filename": "2026-06-19 Дайджест Моргенштерн обеднел Кизару подстрелили Бустер уходит", "content": "---\ntitle: Дайджес…)
+[OK] Сохранено: D:\User Files\Documents\Obsidian Vault\Сценарии\2026-06-19 Дайджест Моргенштерн обеднел Кизару подстрелили Бустер уходит.md
+Word: D:\User Files\Desktop\убиваю бпм\2026-06-19 Дайджест Моргенштерн обеднел Кизару подстрелили Бустер уходит.docx
+
+Готово! Сценарий написан и сохранён.
+
+**Файл:** `2026-06-19 Дайджест Моргенштерн обеднел Кизару подстрелили Бустер уходит`
+
+**Что в сценарии:**
+- Хук + интро
+- Блок про Моргенштерна: донаты на корпоративе в Испании, цитата Рудченко, бонусом — анонс Mercury World Tour Part 2, отказ от мата на концертах и переход в иудаизм
+- Блок про Кизару: операция, перенос альбома, цитата из эфира из палаты, контекст февральского анонса
+- Блок про Бустера: уход из стриминга, последний SLAY, грандиозный стрим 25 февраля. Коллабы с iShowSpeed и Макгрегором отмечены через `[УТОЧНИТЬ: ...]`, так как в загруженных источниках их подтверждения не было
+- Теория про Оливера Три: контекст гибели в Бразилии + грантовая организация для молодых музыкантов как аргумент конспирологов. Конкретные тезисы теории помечены `[УТОЧНИТЬ]`, так как mentoday не открылся
+- Tay Keith: полный некролог с фактами и треками
+- Тёмный принц: «Догвилль» + треклист «Мелитантума» с цитатой
+- Heron на Water и Toxis — даны как блоки с `[УТОЧНИТЬ: ...]`, потому что обе ссылки на the-flow вернули 404
+
+**Честно помечены пробелы** вместо того, чтобы выдумывать факты по Бустер×Speed/Макгрегор, цифрам Toxis, теории про Оливера и релизу Heron на Water.
+────────────────────────────────────────────────────────────
+[DEBUG] block type=text, len=1211
+
+[DEBUG] vault_saved=True, text_len=1211
+[DEBUG] text_preview='Готово! Сценарий написан и сохранён.\n\n**Файл:** `2026-06-19 Дайджест Моргенштерн обеднел Кизару подстрелили Бустер уходит`\n\n**Что в сценарии:**\n- Хук + интро\n- Блок про Моргенштерна: донаты на корпоративе в Испании, цитата Рудченко, бонусом — анонс Mercury World Tour Part 2, отказ от мата на концерт'
+
+
+[OK] Готово.

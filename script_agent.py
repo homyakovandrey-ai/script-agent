@@ -19,7 +19,7 @@ from docx import Document
 from docx.shared import Pt, RGBColor
 
 # Force UTF-8 output on Windows terminals
-if sys.stdout.encoding != "utf-8":
+if sys.stdout is not None and sys.stdout.encoding != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import anthropic
@@ -28,6 +28,8 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 load_dotenv()
+
+_http = httpx.Client(trust_env=False, follow_redirects=True, timeout=30)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -40,32 +42,122 @@ MAX_SCRIPTS = int(os.getenv("MAX_SCRIPTS", "30"))
 
 # ── Obsidian vault ─────────────────────────────────────────────────────────────
 
+_url_cache: dict[str, str] = {}
+
+
+def _read_script(md_file: Path) -> dict | None:
+    try:
+        content = md_file.read_text(encoding="utf-8")
+        if not content.strip():
+            return None
+        return {
+            "filename": md_file.stem,
+            "path": str(md_file.relative_to(VAULT_PATH)),
+            "content": content,
+            "mtime": md_file.stat().st_mtime,
+        }
+    except Exception:
+        return None
+
+
 def load_vault_scripts() -> list[dict]:
     """Load the most recent MAX_SCRIPTS .md scripts from the vault."""
-    scripts = []
     if not VAULT_PATH.exists():
-        return scripts
-
+        return []
     all_files = sorted(
         VAULT_PATH.glob("**/*.md"),
         key=lambda f: f.stat().st_mtime,
-        reverse=True,  # newest first
+        reverse=True,
     )
+    scripts = []
+    for f in all_files[:MAX_SCRIPTS]:
+        s = _read_script(f)
+        if s:
+            scripts.append(s)
+    return list(reversed(scripts))
 
-    for md_file in all_files[:MAX_SCRIPTS]:
+
+def _load_entity_indexes() -> dict[str, list[str]]:
+    """Read entity index files created by link_vault.py.
+    Returns {entity_name_lower: [script_stem, ...]}
+    """
+    index_dir = VAULT_PATH.parent
+    result: dict[str, list[str]] = {}
+    for idx_file in index_dir.glob("*.md"):
         try:
-            content = md_file.read_text(encoding="utf-8")
-            if not content.strip():
-                continue
-            scripts.append({
-                "filename": md_file.stem,
-                "path": str(md_file.relative_to(VAULT_PATH)),
-                "content": content,
-            })
+            content = idx_file.read_text(encoding="utf-8")
+            stems = re.findall(r'\[\[Сценарии/([^\]]+)\]\]', content)
+            if stems:
+                result[idx_file.stem.lower()] = stems
         except Exception:
             pass
+    return result
 
-    return list(reversed(scripts))  # chronological order in prompt
+
+def load_smart_vault_scripts(pre_fetched_text: str) -> list[dict]:
+    """Load topic-relevant scripts using Obsidian entity indexes.
+
+    Matches entities from index files against pre-fetched source text,
+    loads linked scripts first, fills remainder with recent ones.
+    """
+    if not VAULT_PATH.exists():
+        return []
+
+    text_lower = pre_fetched_text.lower()
+    seen: set[str] = set()
+    relevant_stems: list[str] = []
+    matched_entities: list[str] = []
+
+    # Try index-based matching first
+    indexes = _load_entity_indexes()
+    for entity_lower, stems in indexes.items():
+        if entity_lower in text_lower:
+            matched_entities.append(entity_lower)
+            for stem in stems:
+                if stem not in seen:
+                    relevant_stems.append(stem)
+                    seen.add(stem)
+
+    # Build path lookup for fast access
+    all_files = sorted(
+        VAULT_PATH.glob("**/*.md"),
+        key=lambda f: f.stat().st_mtime,
+        reverse=True,
+    )
+    stem_to_path: dict[str, Path] = {f.stem: f for f in all_files}
+
+    scripts: list[dict] = []
+    loaded_paths: set[Path] = set()
+
+    # Load entity-matched scripts (capped at MAX_SCRIPTS)
+    for stem in relevant_stems:
+        if len(scripts) >= MAX_SCRIPTS:
+            break
+        path = stem_to_path.get(stem)
+        if path and path not in loaded_paths:
+            s = _read_script(path)
+            if s:
+                scripts.append(s)
+                loaded_paths.add(path)
+
+    # Fill remainder with most recent
+    for f in all_files:
+        if len(scripts) >= MAX_SCRIPTS:
+            break
+        if f not in loaded_paths:
+            s = _read_script(f)
+            if s:
+                scripts.append(s)
+                loaded_paths.add(f)
+
+    if matched_entities:
+        print(f"    → Совпали сущности: {', '.join(matched_entities)}")
+        print(f"    → Загружено {len([s for s in scripts if s['filename'] in seen])} тематических + {len(scripts) - len([s for s in scripts if s['filename'] in seen])} свежих")
+    else:
+        print(f"    → Тематических совпадений не найдено, загружено {len(scripts)} последних")
+
+    scripts.sort(key=lambda s: s["mtime"])
+    return scripts
 
 
 def save_to_vault(filename: str, content: str) -> str:
@@ -142,6 +234,11 @@ YOUTUBE_RE = re.compile(
     re.IGNORECASE,
 )
 
+TELEGRAM_RE = re.compile(
+    r"(?:t\.me|telegram\.me)/([^/\s?]+)/(\d+)",
+    re.IGNORECASE,
+)
+
 
 def _parse_vtt(text: str) -> str:
     """Convert WebVTT subtitles to clean deduplicated plain text."""
@@ -209,7 +306,7 @@ def fetch_youtube_transcript(url: str) -> str:
         return header + f"(субтитры недоступны)\n\nОписание:\n{desc}"
 
     try:
-        resp = httpx.get(sub_url, timeout=30, follow_redirects=True)
+        resp = _http.get(sub_url)
         resp.raise_for_status()
         transcript = _parse_vtt(resp.text)
     except Exception as e:
@@ -221,12 +318,75 @@ def fetch_youtube_transcript(url: str) -> str:
     return result
 
 
+# ── Telegram fetcher ───────────────────────────────────────────────────────────
+
+def fetch_telegram_post(url: str) -> str:
+    """Fetch text from a public Telegram channel post."""
+    m = TELEGRAM_RE.search(url)
+    if not m:
+        return f"Не удалось разобрать Telegram-ссылку: {url}"
+
+    channel, post_id = m.group(1), m.group(2)
+    web_url = f"https://t.me/s/{channel}/{post_id}"
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0 Safari/537.36"
+        )
+    }
+
+    try:
+        response = _http.get(web_url, headers=headers)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        # Channel title
+        title_el = soup.find(class_="tgme_channel_info_header_title")
+        channel_title = title_el.get_text(strip=True) if title_el else f"@{channel}"
+
+        # Find the specific post by data-post attribute
+        post_div = soup.find(attrs={"data-post": f"{channel}/{post_id}"})
+
+        if post_div:
+            text_el = post_div.find(class_="tgme_widget_message_text")
+            text = text_el.get_text(separator="\n", strip=True) if text_el else ""
+            date_el = post_div.find("time")
+            date_str = (date_el.get("datetime", "")[:10] + " · ") if date_el else ""
+        else:
+            # Fallback: grab all message texts on the page
+            texts = [
+                el.get_text(separator="\n", strip=True)
+                for el in soup.find_all(class_="tgme_widget_message_text")
+            ]
+            text = "\n\n---\n\n".join(texts) if texts else ""
+            date_str = ""
+
+        if not text:
+            return f"[Telegram] {channel_title} — пост #{post_id} (только медиа, текста нет)"
+
+        return f"[Telegram] {channel_title} · {date_str}пост #{post_id}\n\n{text}"
+
+    except Exception as e:
+        return f"Ошибка загрузки Telegram-поста {url}: {e}"
+
+
 # ── Web fetcher ────────────────────────────────────────────────────────────────
 
 def fetch_url(url: str) -> str:
     """Fetch readable text from a URL. YouTube → transcript via yt-dlp."""
+    if url in _url_cache:
+        return _url_cache[url]
     if YOUTUBE_RE.search(url):
-        return fetch_youtube_transcript(url)
+        result = fetch_youtube_transcript(url)
+        _url_cache[url] = result
+        return result
+    if TELEGRAM_RE.search(url):
+        result = fetch_telegram_post(url)
+        _url_cache[url] = result
+        return result
     try:
         headers = {
             "User-Agent": (
@@ -235,7 +395,7 @@ def fetch_url(url: str) -> str:
                 "Chrome/124.0 Safari/537.36"
             )
         }
-        response = httpx.get(url, headers=headers, timeout=30, follow_redirects=True)
+        response = _http.get(url, headers=headers)
         response.raise_for_status()
 
         soup = BeautifulSoup(response.text, "html.parser")
@@ -261,7 +421,9 @@ def fetch_url(url: str) -> str:
         if len(text) > 10_000:
             text = text[:10_000] + "\n\n[... текст обрезан ...]"
 
-        return text or "Не удалось извлечь текст со страницы."
+        result = text or "Не удалось извлечь текст со страницы."
+        _url_cache[url] = result
+        return result
     except Exception as e:
         return f"Ошибка загрузки URL {url}: {e}"
 
@@ -272,7 +434,16 @@ def build_system_prompt(scripts: list[dict]) -> str:
 
     examples_block = ""
     if scripts:
-        examples_block = "\n\n---\n## ТВОИ ПРЕДЫДУЩИЕ СЦЕНАРИИ (изучи стиль, тон, структуру, правила вставок):\n\n"
+        examples_block = "\n\n---\n## ТВОИ ПРЕДЫДУЩИЕ СЦЕНАРИИ\n\n"
+        examples_block += (
+            "Используй эти сценарии в двух целях:\n\n"
+            "**1. Стиль и структура** — изучи тон, голос, формат вставок, способ подачи материала. "
+            "Пиши точно так же.\n\n"
+            "**2. Контекст и история** — эти сценарии показывают, что ты уже рассказывал об этой теме или артисте. "
+            "Используй факты из них как фоновые знания. "
+            "Не повторяй события и темы, которые уже были подробно разобраны — если только новость не добавляет к ним что-то принципиально новое. "
+            "Если повторяешь что-то из прошлых роликов — делай это кратко, как напоминание, а не как основной материал.\n\n"
+        )
         for s in scripts:
             examples_block += f"### {s['path']}\n\n{s['content']}\n\n---\n\n"
     else:
@@ -294,6 +465,14 @@ def build_system_prompt(scripts: list[dict]) -> str:
 3. Пишешь полный сценарий для YouTube-ролика в стиле автора.
 4. Вызываешь save_to_vault, чтобы сохранить сценарий как атомарную заметку.
 5. Сообщаешь, что готово, и где сохранён файл.
+
+## СТРОГИЕ ПРАВИЛА ФАКТЧЕКИНГА (нарушение недопустимо)
+
+- **Только факты из источников.** Используй ТОЛЬКО информацию, которую ты получил через fetch_url. Не добавляй факты, цитаты, события или детали, которых нет в загруженных материалах.
+- **Нет домыслам.** Не придумывай высказывания артистов, даты, суммы, детали биографии, названия треков, конфликты — ничего, чего нет в источнике.
+- **Нет «возможно» и «вероятно».** Не строй предположений, которые могут выглядеть как факты.
+- **Если факта нет — скажи об этом.** Вместо выдуманной детали используй плейсхолдер: [УТОЧНИТЬ: что именно нужно проверить]. Лучше честный пробел, чем ложь.
+- **Цитаты — только дословные.** Цитируй артиста только если его слова есть в источнике дословно. Перефразировать нельзя так, чтобы это выглядело как прямая цитата.
 
 ## СТРУКТУРА СЦЕНАРИЯ (строго соблюдать)
 
@@ -351,6 +530,44 @@ def build_system_prompt(scripts: list[dict]) -> str:
 - **Артисты с иностранными именами:** транслитерируй на русский (21 Сэвэдж, Найн Майс, Мэйби Бэйби)
 - **Иноагенты:** при упоминании Оксимирона, Фэйса — добавлять «иноагент»/«признан иноагентом»
 - **Имя файла:** формат YYYY-MM-DD Название темы (без спецсимволов)
+
+---
+
+## СТОП-СЛОП: ЗАПРЕЩЁННЫЕ AI-ПАТТЕРНЫ
+
+Перед финальной версией сценария убедись, что ни одного из этих паттернов нет.
+
+### Запрещённые фразы-затравки (throat-clearing)
+Не используй фразы, которые объявляют о том, что ты собираешься сказать, вместо того чтобы сказать:
+- «В этом видео мы рассмотрим...», «Сегодня я расскажу...», «Давайте разберёмся...»
+- «Вот в чём дело:» / «Дело вот в чём:» — как самостоятельные вводные (не как маркер речи внутри мысли)
+- «Позвольте объяснить», «Поговорим о...», «Начнём с того, что»
+- Пустые переходы: «Итак», «Таким образом», «Как мы видим», «Подводя итог»
+
+### Запрещённые усилители без содержания
+- Наречия: «абсолютно», «буквально», «реально», «серьёзно», «невероятно», «откровенно говоря»
+- Пустые интенсификаторы: «очень», «крайне», «исключительно» — если следующее слово не несёт конкретики
+- Фальшивый пафос: «это меняет всё», «история не знает таких случаев», «это революция»
+
+### Запрещённые структурные паттерны
+- **Бинарный контраст:** «Это не X. Это Y.» — скажи Y напрямую
+- **Отрицательный список:** сначала перечислять чем что-то НЕ является, потом называть
+- **Драматическая фрагментация:** отдельные слова. В отдельных предложениях. Для пафоса. — запрещено
+- **Риторическая подводка:** «А что если я скажу вам, что...», «Подумайте об этом:», «Представьте себе...»
+- **Пассивный залог без субъекта:** «было сделано», «оказалось решено» — называй кто сделал
+- **Мета-комментарий:** не ссылайся на структуру самого видео («как мы увидим далее», «в конце ролика»)
+
+### Запрещённые декларативы
+Не объявляй о важности — показывай фактами:
+- «Последствия оказались значительными» → назови конкретные последствия
+- «Это очень важно понять» → скажи что именно и почему
+- «Ситуация непростая» → опиши конкретную сложность
+
+### Ритм
+- Не пиши три предложения подряд одинаковой длины
+- Чередуй: короткий удар → развёрнутая мысль → снова удар
+- Каждое предложение — живой человек что-то делает, а не абстракция «происходит»
+
 {examples_block}"""
 
 # ── Tool definitions (JSON Schema) ────────────────────────────────────────────
@@ -406,13 +623,27 @@ def run_tool(name: str, inputs: dict) -> str:
 
 # ── Agent loop ─────────────────────────────────────────────────────────────────
 
+_LOG_PATH = Path(__file__).parent / "debug.log"
+
+def _log(text: str) -> None:
+    try:
+        with open(_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(text)
+    except Exception:
+        pass
+
 def generate_script(
     urls: list[str],
     length_min: int | None = None,
     inserts: list[str] | None = None,
     note: str | None = None,
+    stop_event=None,
 ) -> None:
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    _LOG_PATH.write_text("", encoding="utf-8")  # clear log at start
+    client = anthropic.Anthropic(
+        api_key=ANTHROPIC_API_KEY,
+        http_client=httpx.Client(trust_env=False),
+    )
 
     print(f"\n[>] Источников: {len(urls)}")
     for u in urls:
@@ -423,52 +654,59 @@ def generate_script(
         print(f"    Вставок задано: {len(inserts)}")
     if note:
         print(f"    Указание: {note}")
-    print("[*] Читаю vault...")
+    print("[*] Загружаю источники и читаю vault...")
+    pre_text = ""
+    for u in urls:
+        pre_text += fetch_url(u) + "\n\n"
 
-    scripts = load_vault_scripts()
+    total = sum(1 for _ in VAULT_PATH.glob("**/*.md")) if VAULT_PATH.exists() else 0
+    scripts = load_smart_vault_scripts(pre_text)
     if scripts:
-        total = sum(1 for _ in VAULT_PATH.glob("**/*.md")) if VAULT_PATH.exists() else 0
-        print(f"    → Загружено {len(scripts)} из {total} сценариев (самые свежие)")
+        print(f"    → Итого загружено {len(scripts)} из {total} сценариев")
     else:
         print("    → Vault пуст. Работаю без примеров стиля.")
 
     system_prompt = build_system_prompt(scripts)
 
-    if len(urls) == 1:
-        user_msg = f"Напиши сценарий для YouTube-ролика по этой новости: {urls[0]}\n\n"
-    else:
-        user_msg = "Напиши сценарий для YouTube-ролика, используя все эти источники:\n"
-        for i, u in enumerate(urls, 1):
-            user_msg += f"  {i}. {u}\n"
-        user_msg += "\n"
+    # Build user message with pre-fetched content already included
+    user_msg = "Напиши полный сценарий для YouTube-ролика на основе следующих материалов.\n\n"
+
+    for i, u in enumerate(urls, 1):
+        content = fetch_url(u)
+        user_msg += f"## Источник {i}: {u}\n\n{content}\n\n---\n\n"
 
     if length_min:
         approx_words = length_min * 140
-        user_msg += f"Длина сценария: примерно {length_min} минут (~{approx_words} слов).\n"
+        user_msg += f"Длина сценария: примерно {length_min} минут (~{approx_words} слов).\n\n"
     if inserts:
         user_msg += "Обязательно включи эти YouTube-вставки в сценарий:\n"
         for url in inserts:
             user_msg += f"  (вставить {url} )\n"
         user_msg += "\n"
     if note:
-        user_msg += f"Дополнительные указания: {note}\n\n"
+        user_msg += (
+            f"\n⚠️ ОБЯЗАТЕЛЬНОЕ ТЗ — выполнить строго и полностью:\n"
+            f"{note}\n\n"
+        )
 
-    fetch_instruction = (
-        "Загрузи все источники инструментом fetch_url (каждый по очереди), "
-        "объедини информацию и напиши полноценный сценарий. Затем сохрани его в vault."
-    )
-    user_msg += fetch_instruction
+    user_msg += "Напиши полноценный сценарий и сохрани его в vault инструментом save_to_vault."
 
     messages = [{"role": "user", "content": user_msg}]
 
     print("\n[AI] Агент работает...\n")
     print("─" * 60)
 
+    all_text_parts: list[str] = []
+    vault_saved = False
+
     # Agentic loop
     while True:
+        if stop_event and stop_event.is_set():
+            print("\n[СТОП] Генерация прервана пользователем.")
+            break
         with client.messages.stream(
             model=MODEL,
-            max_tokens=8192,
+            max_tokens=16000,
             thinking={"type": "adaptive"},
             system=[
                 {
@@ -490,6 +728,7 @@ def generate_script(
                     and event.delta.type == "text_delta"
                 ):
                     print(event.delta.text, end="", flush=True)
+                    all_text_parts.append(event.delta.text)
 
             response = stream.get_final_message()
 
@@ -499,6 +738,10 @@ def generate_script(
         # Done
         if response.stop_reason == "end_turn":
             print("\n" + "─" * 60)
+            # Debug: show what text blocks the model returned
+            for blk in assistant_content:
+                if hasattr(blk, "type"):
+                    print(f"[DEBUG] block type={blk.type}, len={len(getattr(blk, 'text', '') or getattr(blk, 'thinking', '') or '')}")
             break
 
         # Execute tools
@@ -518,6 +761,7 @@ def generate_script(
                 result = run_tool(block.name, block.input)
 
                 if block.name == "save_to_vault":
+                    vault_saved = True
                     print(f"[OK] {result}")
                 else:
                     preview = result[:200].replace("\n", " ")
@@ -536,6 +780,29 @@ def generate_script(
         else:
             # Unexpected stop
             break
+
+    # Debug info
+    full_text = "".join(all_text_parts).strip()
+    debug_msg = f"\n[DEBUG] vault_saved={vault_saved}, text_len={len(full_text)}\n[DEBUG] text_preview={full_text[:300]!r}\n"
+    print(debug_msg)
+    _log(debug_msg)
+    _log(f"\n--- FULL CAPTURED TEXT ---\n{full_text}\n--- END ---\n")
+
+    # Fallback: if agent never called save_to_vault but generated text — save it automatically
+    if not vault_saved:
+        if len(full_text) > 1500:
+            # Try to extract title from first heading or first line
+            title_match = re.search(r"^#+\s*(.+)", full_text, re.MULTILINE)
+            if title_match:
+                raw_title = title_match.group(1).strip()
+            else:
+                raw_title = full_text.splitlines()[0][:60].strip()
+            filename = f"{datetime.now().strftime('%Y-%m-%d')} {raw_title}"
+            print(f"\n[!] save_to_vault не был вызван. Автосохранение...")
+            md_result = save_to_vault(filename, full_text)
+            docx_result = save_to_docx(filename, full_text)
+            print(f"[OK] {md_result}")
+            print(f"[OK] {docx_result}")
 
     print("\n[OK] Готово.")
 

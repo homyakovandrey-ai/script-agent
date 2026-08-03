@@ -11,15 +11,18 @@ import tkinter as tk
 from tkinter import ttk, scrolledtext
 from pathlib import Path
 
-if sys.stdout.encoding != "utf-8":
+if sys.stdout is not None and sys.stdout.encoding != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+LOG_FILE = Path(__file__).parent / "output" / "last_run_log.txt"
 
 
 # ── Stdout redirect to a log widget ───────────────────────────────────────────
 
 class _LogRedirect:
-    def __init__(self, widget: scrolledtext.ScrolledText):
+    def __init__(self, widget: scrolledtext.ScrolledText, log_file=None):
         self._w = widget
+        self._log_file = log_file
         self.encoding = "utf-8"
 
     def write(self, text: str):
@@ -27,6 +30,12 @@ class _LogRedirect:
         self._w.insert(tk.END, text)
         self._w.see(tk.END)
         self._w.configure(state="disabled")
+        if self._log_file:
+            try:
+                with open(self._log_file, "a", encoding="utf-8") as f:
+                    f.write(text)
+            except Exception:
+                pass
 
     def flush(self):
         pass
@@ -56,6 +65,38 @@ def _url_entry(parent, var: tk.StringVar) -> tk.Entry:
     return e
 
 
+def _bind_paste(widget: tk.Text):
+    def _do_paste():
+        try:
+            text = widget.clipboard_get()
+        except tk.TclError:
+            return
+        if widget.tag_ranges("sel"):
+            widget.delete("sel.first", "sel.last")
+        widget.insert(tk.INSERT, text)
+
+    def _paste(event):
+        widget.after(10, _do_paste)
+        return "break"
+
+    widget.bind("<Control-v>", _paste)
+    widget.bind("<Control-V>", _paste)
+    widget.bind("<<Paste>>", _paste)
+
+
+def _paste_button(parent, widget: tk.Text) -> tk.Button:
+    def _click():
+        try:
+            text = widget.clipboard_get()
+        except tk.TclError:
+            return
+        widget.insert(tk.END, text.strip() + "\n")
+
+    return tk.Button(parent, text="Вставить", command=_click,
+                     font=("Segoe UI", 9), relief="flat",
+                     bg="#e8eaf6", cursor="hand2", padx=6, pady=2)
+
+
 # ── Tab 1: Сценарий ────────────────────────────────────────────────────────────
 
 def build_script_tab(nb: ttk.Notebook):
@@ -64,22 +105,41 @@ def build_script_tab(nb: ttk.Notebook):
 
     pad = {"padx": 10, "pady": 4}
 
-    tk.Label(frame, text="URL источника(ов)", anchor="w").pack(fill="x", **pad)
-    url_var = tk.StringVar()
-    entry = _url_entry(frame, url_var)
-    entry.pack(fill="x", padx=10, pady=(0, 2))
-    entry.focus()
-    tk.Label(frame, text="Несколько ссылок — через пробел", fg="grey",
-             font=("Segoe UI", 8), anchor="w").pack(fill="x", padx=10)
+    hdr = tk.Frame(frame)
+    hdr.pack(fill="x", padx=10, pady=(4, 0))
+    tk.Label(hdr, text="Ссылки на источники (по одной на строку)", anchor="w").pack(side="left")
+    url_frame = tk.Frame(frame)
+    url_frame.pack(fill="both", padx=10, pady=(2, 0))
+    url_scroll = tk.Scrollbar(url_frame)
+    url_scroll.pack(side="right", fill="y")
+    url_text = tk.Text(url_frame, height=12, font=("Consolas", 10), wrap="none",
+                       yscrollcommand=url_scroll.set)
+    url_text.pack(side="left", fill="both", expand=True)
+    url_scroll.config(command=url_text.yview)
+    _bind_paste(url_text)
+    _paste_button(hdr, url_text).pack(side="right")
+    url_text.focus()
 
     row = tk.Frame(frame)
     row.pack(fill="x", **pad)
     tk.Label(row, text="Длина (мин)").pack(side="left")
     length_var = tk.StringVar()
-    tk.Entry(row, textvariable=length_var, width=5).pack(side="left", padx=(4, 20))
-    tk.Label(row, text="Указания").pack(side="left")
-    note_var = tk.StringVar()
-    tk.Entry(row, textvariable=note_var).pack(side="left", fill="x", expand=True, padx=(4, 0))
+    tk.Entry(row, textvariable=length_var, width=5).pack(side="left", padx=(4, 0))
+
+    note_hdr = tk.Frame(frame)
+    note_hdr.pack(fill="x", padx=10, pady=(6, 0))
+    tk.Label(note_hdr, text="ТЗ / Указания агенту (всё написанное будет строго исполнено)",
+             anchor="w", font=("Segoe UI", 9, "bold")).pack(side="left")
+    note_frame = tk.Frame(frame)
+    note_frame.pack(fill="both", padx=10, pady=(2, 4))
+    note_scroll = tk.Scrollbar(note_frame)
+    note_scroll.pack(side="right", fill="y")
+    note_text = tk.Text(note_frame, height=6, font=("Consolas", 10), wrap="word",
+                        yscrollcommand=note_scroll.set)
+    note_text.pack(side="left", fill="both", expand=True)
+    note_scroll.config(command=note_text.yview)
+    _bind_paste(note_text)
+    _paste_button(note_hdr, note_text).pack(side="right")
 
     tk.Label(frame, text="Вставки с YouTube (через пробел)", anchor="w").pack(fill="x", **pad)
     inserts_var = tk.StringVar()
@@ -87,24 +147,30 @@ def build_script_tab(nb: ttk.Notebook):
 
     log = _make_log(frame)
     status_var = tk.StringVar(value="Готов")
+    _stop_event = threading.Event()
 
     def run():
-        urls_raw = url_var.get().strip()
+        urls_raw = url_text.get("1.0", tk.END).strip()
         if not urls_raw:
             status_var.set("Введи хотя бы один URL")
             return
         _clear_log(log)
+        _stop_event.clear()
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        LOG_FILE.write_text("", encoding="utf-8")
         btn.configure(state="disabled", text="  Генерирую...  ")
+        stop_btn.configure(state="normal")
         status_var.set("Агент работает...")
-        sys.stdout = _LogRedirect(log)
-        sys.stderr = _LogRedirect(log)
+        redirector = _LogRedirect(log, LOG_FILE)
+        sys.stdout = redirector
+        sys.stderr = redirector
 
         urls = urls_raw.split()
         length_raw = length_var.get().strip()
         length_min = int(length_raw) if length_raw.isdigit() else None
         inserts_raw = inserts_var.get().strip()
         inserts = inserts_raw.split() if inserts_raw else None
-        note = note_var.get().strip() or None
+        note = note_text.get("1.0", tk.END).strip() or None
 
         def worker():
             try:
@@ -114,24 +180,49 @@ def build_script_tab(nb: ttk.Notebook):
                 )
                 mod = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(mod)
-                mod.generate_script(urls, length_min=length_min, inserts=inserts, note=note)
-                frame.after(0, lambda: status_var.set("Готово"))
+                mod.generate_script(
+                    urls, length_min=length_min, inserts=inserts,
+                    note=note, stop_event=_stop_event,
+                )
+                if _stop_event.is_set():
+                    frame.after(0, lambda: status_var.set(
+                        f"Остановлено. Лог: {LOG_FILE}"
+                    ))
+                else:
+                    frame.after(0, lambda: status_var.set("Готово"))
             except Exception as e:
                 print(f"\n[ОШИБКА] {e}")
                 frame.after(0, lambda: status_var.set(f"Ошибка: {e}"))
             finally:
-                frame.after(0, lambda: btn.configure(
-                    state="normal", text="  Генерировать сценарий  "
+                frame.after(0, lambda: (
+                    btn.configure(state="normal", text="  Генерировать сценарий  "),
+                    stop_btn.configure(state="disabled"),
                 ))
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def stop():
+        _stop_event.set()
+        stop_btn.configure(state="disabled")
+        print(f"\n[!] Остановлено пользователем.\n[!] Лог сохранён: {LOG_FILE}")
+
+    btn_row = tk.Frame(frame)
+    btn_row.pack(pady=(2, 6))
+
     btn = tk.Button(
-        frame, text="  Генерировать сценарий  ", command=run,
+        btn_row, text="  Генерировать сценарий  ", command=run,
         bg="#1a73e8", fg="white", font=("Segoe UI", 11, "bold"),
         relief="flat", cursor="hand2", padx=10, pady=6,
     )
-    btn.pack(pady=(2, 6))
+    btn.pack(side="left", padx=(0, 6))
+
+    stop_btn = tk.Button(
+        btn_row, text="  Стоп  ", command=stop,
+        bg="#d32f2f", fg="white", font=("Segoe UI", 11, "bold"),
+        relief="flat", cursor="hand2", padx=10, pady=6,
+        state="disabled",
+    )
+    stop_btn.pack(side="left")
 
     tk.Label(frame, text="Вывод агента", anchor="w").pack(fill="x", padx=10)
     log.pack(fill="both", expand=True, padx=10, pady=(0, 6))
@@ -156,10 +247,19 @@ def build_ingest_tab(nb: ttk.Notebook):
         justify="left", fg="#555",
     ).pack(fill="x", padx=10, pady=(10, 4))
 
-    tk.Label(frame, text="URL(s) — через пробел", anchor="w").pack(fill="x", **pad)
-    url_var = tk.StringVar()
-    entry = _url_entry(frame, url_var)
-    entry.pack(fill="x", padx=10, pady=(0, 6))
+    hdr2 = tk.Frame(frame)
+    hdr2.pack(fill="x", padx=10, pady=(4, 0))
+    tk.Label(hdr2, text="Ссылки (по одной на строку)", anchor="w").pack(side="left")
+    url_frame = tk.Frame(frame)
+    url_frame.pack(fill="both", padx=10, pady=(2, 6))
+    url_scroll = tk.Scrollbar(url_frame)
+    url_scroll.pack(side="right", fill="y")
+    url_text = tk.Text(url_frame, height=12, font=("Consolas", 10), wrap="none",
+                       yscrollcommand=url_scroll.set)
+    url_text.pack(side="left", fill="both", expand=True)
+    url_scroll.config(command=url_text.yview)
+    _bind_paste(url_text)
+    _paste_button(hdr2, url_text).pack(side="right")
 
     row = tk.Frame(frame)
     row.pack(fill="x", **pad)
@@ -173,7 +273,7 @@ def build_ingest_tab(nb: ttk.Notebook):
     status_var = tk.StringVar(value="Готов")
 
     def run():
-        urls_raw = url_var.get().strip()
+        urls_raw = url_text.get("1.0", tk.END).strip()
         if not urls_raw:
             status_var.set("Введи хотя бы один URL")
             return
@@ -228,7 +328,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Убиваю БПМ — Агент")
-        self.minsize(560, 480)
+        self.minsize(560, 700)
 
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=6, pady=6)
@@ -236,7 +336,7 @@ class App(tk.Tk):
         build_script_tab(nb)
         build_ingest_tab(nb)
 
-        w, h = 620, 560
+        w, h = 620, 780
         x = (self.winfo_screenwidth() - w) // 2
         y = (self.winfo_screenheight() - h) // 2
         self.geometry(f"{w}x{h}+{x}+{y}")

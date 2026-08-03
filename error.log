@@ -1,0 +1,7 @@
+Traceback (most recent call last):
+  File "D:\User Files\Desktop\Интенсив Рустам\script_agent\run_gui.pyw", line 12, in <module>
+    import app
+  File "D:\User Files\Desktop\Интенсив Рустам\script_agent\app.py", line 14, in <module>
+    if sys.stdout.encoding != "utf-8":
+       ^^^^^^^^^^^^^^^^^^^
+AttributeError: 'NoneType' object has no attribute 'encoding'

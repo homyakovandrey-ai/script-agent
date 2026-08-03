@@ -8,12 +8,13 @@ For each key entity (artist, topic), scans every script and:
   3. Creates an index note for each entity listing all related scripts
 """
 
+import os
 import re
 import sys
 from pathlib import Path
 from collections import defaultdict
 
-VAULT = Path(r"D:\User Files\Documents\Obsidian Vault\Сценарии")
+VAULT = Path(os.getenv("VAULT_PATH", "./vault"))
 
 # ─── Entity definitions ────────────────────────────────────────────────────────
 # Format: ("Display Name for index note", "wikilink target filename", [regex patterns])

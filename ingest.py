@@ -12,7 +12,7 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 
-if sys.stdout.encoding != "utf-8":
+if sys.stdout is not None and sys.stdout.encoding != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import anthropic
